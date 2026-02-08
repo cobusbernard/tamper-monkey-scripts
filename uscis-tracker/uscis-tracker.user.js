@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         USCIS Case Tracker
 // @namespace    http://tampermonkey.net/
-// @version      0.3
+// @version      0.4
 // @description  Track USCIS case changes with local storage
 // @author       Cobus Bernard
 // @match        https://my.uscis.gov/account/applicant*
@@ -193,7 +193,7 @@
                     <strong style="color: #0066cc;">${caseNum} - ${caseData.formType}</strong><br>
                     <small style="color: #333;"><strong>Form:</strong>${caseData.formName}</small><br>
                     <small style="color: #333;"><strong>Last Updated:</strong> ${formatDate(caseData.updatedAtTimestamp)}</small><br>
-                    <small style="color: #333;"><strong>Current Action:</strong> ${caseData.currentActionCode}</small>
+                    <small style="color: #333;"><strong>Current Action:</strong> ${caseData.currentActionCode} - ${caseData.currentActionDesc}</small>
 
                     <details style="margin-top: 8px; cursor: pointer;">
                         <summary style="color: #0066cc; font-weight: bold;">Events History (${caseData.events.length})</summary>

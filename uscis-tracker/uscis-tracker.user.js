@@ -20,7 +20,7 @@
         ['IAF', 'Receipt letter emailed'],
         ['FTA0', 'Biometrics / database checks received'],
         ['SA', 'Status Adjusted'],
-        ['LDF', 'Card Produced'],
+        ['LDA', 'Card Produced'],
         ['H008', 'Case Approved'],
         ['H016', 'Case Denied'],
         ['IKA', 'RFE issued']

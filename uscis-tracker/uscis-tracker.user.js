@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         USCIS Case Tracker
 // @namespace    http://tampermonkey.net/
-// @version      0.4
-// @description  Track USCIS case changes with local storage
+// @version      0.5
+// @description  Track USCIS case changes with local storage and history
 // @author       Cobus Bernard
 // @match        https://my.uscis.gov/account/applicant*
 // @grant        none
@@ -15,6 +15,7 @@
     'use strict';
 
     const STORAGE_KEY = 'uscis_cases_data';
+    const HISTORY_KEY = 'uscis_cases_history';
     const API_URL = 'https://my.uscis.gov/account/case-service/api/cases';
     const EVENT_CODES = new Map([
         ['IAF', 'Receipt letter emailed'],
@@ -26,78 +27,59 @@
         ['IKA', 'RFE issued']
     ]);
 
-    // Helper function to sleep/delay
+    let caseIdsHidden = true;
+    let currentCaseData = {};
+    let fieldHighlights = {};
+
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    // Returns the description for an event code
+    function escapeHtml(str) {
+        if (str == null) return '';
+        const div = document.createElement('div');
+        div.textContent = String(str);
+        return div.innerHTML;
+    }
+
     function getEventCodeDescription(key) {
         const normalizedKey = key.toUpperCase();
-        const lookupKey = EVENT_CODES.get(normalizedKey);
-
-        return lookupKey ?? "Unknown";
+        return EVENT_CODES.get(normalizedKey) ?? "Unknown";
     }
 
-    // Wait for page to be fully ready with case data visible
-    async function waitForCasesToLoad(maxAttempts = 30) {
-        for (let i = 0; i < maxAttempts; i++) {
-            const caseNumbers = extractCaseNumbersFromDOM();
-            if (caseNumbers.length > 0) {
-                return caseNumbers;
-            }
-            // Wait 500ms before trying again
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-        console.warn('Timeout waiting for cases to load');
-        return extractCaseNumbersFromDOM(); // Return whatever we have
-    }
-
-    // Extract case numbers from the DOM instead of hard-coding
     function extractCaseNumbersFromDOM() {
-        const caseNumbers = [];
         const pageText = document.body.innerText;
         const matches = pageText.match(/IOE\d+/g);
-        if (matches) {
-            return Array.from(new Set(matches)); // Remove duplicates
-        }
-        return caseNumbers;
+        return matches ? Array.from(new Set(matches)) : [];
     }
 
-    // Fetch individual case data
     async function fetchCaseData(caseNumber) {
         try {
-
             const statusResponse = await fetch(`${API_URL}/${caseNumber}`);
             const statusData = await statusResponse.json();
 
             const docResponse = await fetch(`${API_URL}/${caseNumber}/documents`);
             const documentsData = await docResponse.json();
 
-            // Extract the relevant data
             const caseInfo = statusData.data || {};
 
-            // Sort events in descending order by date (most recent first)
             const sortedEvents = (caseInfo.events || [])
                 .map(event => ({
                     eventCode: event.eventCode,
                     eventDesc: getEventCodeDescription(event.eventCode),
                     updatedAtTimestamp: event.updatedAtTimestamp
                 }))
-                .sort((a, b) => {
-                    // Parse dates and sort in descending order (newest first)
-                    const dateA = new Date(a.updatedAtTimestamp).getTime();
-                    const dateB = new Date(b.updatedAtTimestamp).getTime();
-                    return dateB - dateA;
-                });
+                .sort((a, b) => new Date(b.updatedAtTimestamp) - new Date(a.updatedAtTimestamp));
 
             return {
-                caseNumber: caseNumber,
+                caseNumber,
                 formType: caseInfo.formType,
                 formName: caseInfo.formName,
+                closed: caseInfo.closed,
+                updatedAt: caseInfo.updatedAt,
                 updatedAtTimestamp: caseInfo.updatedAtTimestamp,
-                currentActionCode: sortedEvents[0].eventCode,
-                currentActionDesc: sortedEvents[0].eventDesc,
+                currentActionCode: sortedEvents[0]?.eventCode,
+                currentActionDesc: sortedEvents[0]?.eventDesc,
                 events: sortedEvents,
                 documents: documentsData,
                 lastFetched: new Date().toISOString()
@@ -108,189 +90,366 @@
         }
     }
 
-    // Load stored data
-    function getStoredData() {
-        const stored = localStorage.getItem(STORAGE_KEY);
-        return stored ? JSON.parse(stored) : { cases: {}, lastFetch: null };
+    // --- History Management ---
+
+    function getHistory() {
+        return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
     }
 
-    // Compare and detect changes
-    function detectChanges(oldData, newData) {
-        const changes = [];
+    function getLastSavedCases() {
+        const history = getHistory();
+        if (history.length > 0) {
+            return history[history.length - 1].cases;
+        }
+        // Migrate from legacy single-snapshot format
+        const legacy = localStorage.getItem(STORAGE_KEY);
+        if (legacy) {
+            const parsed = JSON.parse(legacy);
+            return parsed.cases || {};
+        }
+        return {};
+    }
 
-        Object.keys(newData).forEach(caseNum => {
-            if (!oldData[caseNum]) {
-                changes.push({
-                    caseNum,
-                    type: 'NEW',
-                    data: newData[caseNum],
-                    changeDetails: 'New case added'
+    function saveToHistory(casesData) {
+        const history = getHistory();
+        history.push({
+            cases: casesData,
+            savedAt: new Date().toISOString()
+        });
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            cases: casesData,
+            lastFetch: new Date().toISOString()
+        }));
+    }
+
+    function clearAllHistory() {
+        localStorage.removeItem(HISTORY_KEY);
+        localStorage.removeItem(STORAGE_KEY);
+    }
+
+    // --- Change Detection ---
+
+    function detectFieldHighlights(oldCases, newCases) {
+        const highlights = {};
+        Object.keys(newCases).forEach(caseNum => {
+            highlights[caseNum] = {
+                isNew: false,
+                updatedAtChanged: false,
+                newEventIndices: new Set()
+            };
+            if (!oldCases[caseNum]) {
+                highlights[caseNum].isNew = true;
+                highlights[caseNum].updatedAtChanged = true;
+                newCases[caseNum].events.forEach((_, i) => {
+                    highlights[caseNum].newEventIndices.add(i);
                 });
             } else {
-                // Check if case was updated
-                if (oldData[caseNum].updatedAtTimestamp !== newData[caseNum].updatedAtTimestamp) {
-                    changes.push({
-                        caseNum,
-                        type: 'UPDATED',
-                        data: newData[caseNum],
-                        oldTimestamp: oldData[caseNum].updatedAtTimestamp,
-                        changeDetails: `Case updated from ${oldData[caseNum].updatedAtTimestamp} to ${newData[caseNum].updatedAtTimestamp}`
-                    });
+                if (oldCases[caseNum].updatedAtTimestamp !== newCases[caseNum].updatedAtTimestamp ||
+                    oldCases[caseNum].updatedAt !== newCases[caseNum].updatedAt) {
+                    highlights[caseNum].updatedAtChanged = true;
                 }
-                // Check if new events were added
-                const oldEventCount = (oldData[caseNum].events || []).length;
-                const newEventCount = (newData[caseNum].events || []).length;
-                if (newEventCount > oldEventCount) {
-                    const newEvents = newData[caseNum].events.slice(0, newEventCount - oldEventCount);
-                    changes.push({
-                        caseNum,
-                        type: 'NEW_EVENTS',
-                        data: newData[caseNum],
-                        newEvents: newEvents,
-                        changeDetails: `${newEventCount - oldEventCount} new event(s) added`
-                    });
-                }
+                const oldEventKeys = new Set(
+                    (oldCases[caseNum].events || []).map(e => `${e.eventCode}_${e.updatedAtTimestamp}`)
+                );
+                (newCases[caseNum].events || []).forEach((event, i) => {
+                    const key = `${event.eventCode}_${event.updatedAtTimestamp}`;
+                    if (!oldEventKeys.has(key)) {
+                        highlights[caseNum].newEventIndices.add(i);
+                    }
+                });
             }
         });
-
-        return changes;
+        return highlights;
     }
 
-    // Create notification pane with detailed info
-    function createNotificationPane(allCaseData) {
-        let pane = document.getElementById('uscis-tracker-pane');
-        if (!pane) {
-            pane = document.createElement('div');
-            pane.id = 'uscis-tracker-pane';
-            pane.style.cssText = `
-                position: fixed;
-                top: 80px;
-                right: 20px;
-                width: 350px;
-                max-height: 2000px;
-                background: white;
-                border: 2px solid #0066cc;
-                border-radius: 8px;
-                padding: 15px;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-                z-index: 10000;
-                overflow-y: auto;
-                font-family: Arial, sans-serif;
-                font-size: 12px;
-            `;
-            document.body.appendChild(pane);
-        }
+    // --- Display Helpers ---
 
-        // Sort case numbers in ascending order
-        const sortedCaseNumbers = Object.keys(allCaseData).sort();
-
-        let html = '<h3 style="margin: 0 0 15px 0; color: #0066cc;">USCIS Case Status</h3>';
-
-        sortedCaseNumbers.forEach(caseNum => {
-            const caseData = allCaseData[caseNum];
-            html += `
-                <div style="padding: 12px; margin: 10px 0; background: #f0f8ff; border-left: 4px solid #0066cc; border-radius: 4px;">
-                    <strong style="color: #0066cc;">${caseNum} - ${caseData.formType}</strong><br>
-                    <small style="color: #333;"><strong>Form:</strong>${caseData.formName}</small><br>
-                    <small style="color: #333;"><strong>Last Updated:</strong> ${formatDate(caseData.updatedAtTimestamp)}</small><br>
-                    <small style="color: #333;"><strong>Current Action:</strong> ${caseData.currentActionCode} - ${caseData.currentActionDesc}</small>
-
-                    <details style="margin-top: 8px; cursor: pointer;">
-                        <summary style="color: #0066cc; font-weight: bold;">Events History (${caseData.events.length})</summary>
-                        <div style="margin-top: 8px; background: white; padding: 8px; border-radius: 3px;">
-                            ${caseData.events.map(event => `
-                                <div style="margin-bottom: 8px; padding: 6px; background: #e8f4f8; border-radius: 3px;">
-                                    <strong style="color: #0066cc;">${event.eventCode} - ${event.eventDesc}</strong><br>
-                                    <strong style="color: #666;">${formatDate(event.updatedAtTimestamp)}</strong><br>
-                                </div>
-                            `).join('')}
-                        </div>
-                    </details>
-                </div>
-            `;
-        });
-
-        pane.innerHTML = html;
-    }
-
-    // Helper function to format dates
     function formatDate(dateString) {
         if (!dateString) return 'Unknown';
         try {
             const date = new Date(dateString);
             return date.toLocaleString('en-US', {
-                year: 'numeric',
-                month: 'short',
-                day: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit'
+                year: 'numeric', month: 'short', day: 'numeric',
+                hour: '2-digit', minute: '2-digit'
             });
         } catch (e) {
             return dateString;
         }
     }
 
-    // Wait for the CaseCardsApp component to load
-    async function waitForCaseCardsComponent(maxAttempts = 30) {
-        // Initial 1 second delay
-        await sleep(1000);
+    function maskCaseId(caseId) {
+        return caseId.replace(/\d/g, '*');
+    }
 
-        for (let i = 0; i < maxAttempts; i++) {
-            // Look for divs with id matching pattern: CaseCardsApp-react-component-*
-            const caseCardDivs = document.querySelectorAll('[id^="CaseCardsApp-react-component-"]');
+    function displayCaseId(caseId) {
+        return caseIdsHidden ? maskCaseId(caseId) : caseId;
+    }
 
-            if (caseCardDivs.length > 0) {
-                console.log('CaseCardsApp component found');
-                return caseCardDivs[0]; // Return the first matching div
+    function daysBetween(date1, date2) {
+        return Math.floor(Math.abs(new Date(date1) - new Date(date2)) / (1000 * 60 * 60 * 24));
+    }
+
+    // --- DOM Construction Helpers ---
+
+    function el(tag, styles, children) {
+        const element = document.createElement(tag);
+        if (styles) Object.assign(element.style, styles);
+        if (children) {
+            if (typeof children === 'string') {
+                element.textContent = children;
+            } else if (Array.isArray(children)) {
+                children.forEach(child => {
+                    if (child) element.appendChild(child);
+                });
+            } else {
+                element.appendChild(children);
             }
+        }
+        return element;
+    }
 
-            console.log(`Waiting for CaseCardsApp component... attempt ${i + 1}/${maxAttempts}`);
-            await sleep(500); // Check every 500ms
+    function textNode(text) {
+        return document.createTextNode(text);
+    }
+
+    // --- Timeline Rendering ---
+
+    function renderTimelineEvent(event, i, events, caseHighlights) {
+        const isOldest = i === events.length - 1;
+        const isHighlighted = caseHighlights?.newEventIndices?.has(i);
+        const circleContent = isOldest ? '' : `${String(daysBetween(event.updatedAtTimestamp, events[i + 1].updatedAtTimestamp))}d`;
+        const accent = isHighlighted ? '#00a000' : '#0066cc';
+        const textColor = isHighlighted ? '#00a000' : '#666';
+
+        const circle = el('div', {
+            width: '28px', height: '28px', borderRadius: '50%',
+            border: `2px solid ${accent}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: '9px', fontWeight: 'bold', color: accent,
+            background: 'white', flexShrink: '0'
+        }, circleContent);
+
+        const timelineCol = el('div', {
+            display: 'flex', flexDirection: 'column', alignItems: 'center',
+            width: '36px', flexShrink: '0'
+        }, [circle]);
+
+        if (!isOldest) {
+            timelineCol.appendChild(el('div', {
+                width: '2px', flex: '1', minHeight: '8px', background: '#b0d0e8'
+            }));
         }
 
+        const eventLabel = el('strong', { color: accent },
+            `${escapeHtml(event.eventCode)} - ${escapeHtml(event.eventDesc)}`);
+        const eventDate = el('span', { color: textColor }, formatDate(event.updatedAtTimestamp));
+
+        const content = el('div', {
+            marginLeft: '8px', paddingBottom: isOldest ? '0' : '12px', flex: '1'
+        });
+        content.appendChild(eventLabel);
+        content.appendChild(document.createElement('br'));
+        content.appendChild(eventDate);
+
+        return el('div', { display: 'flex', alignItems: 'stretch' }, [timelineCol, content]);
+    }
+
+    function renderTimeline(events, caseHighlights) {
+        if (!events || events.length === 0) {
+            return el('em', {}, 'No events');
+        }
+        const container = el('div', {});
+        events.forEach((event, i) => {
+            container.appendChild(renderTimelineEvent(event, i, events, caseHighlights));
+        });
+        return container;
+    }
+
+    // --- Case Card Rendering ---
+
+    function renderCaseCard(caseNum, caseData, highlights) {
+        const updatedAtColor = highlights.updatedAtChanged ? '#00a000' : '#333';
+
+        const card = el('div', {
+            padding: '12px', margin: '0 0 10px 0', background: '#f0f8ff',
+            borderLeft: '4px solid #0066cc', borderRadius: '4px'
+        });
+
+        const closedLabel = caseData.closed ? ' (Closed)' : '';
+        const title = el('strong', { color: '#0066cc' },
+            `${escapeHtml(displayCaseId(caseNum))} - ${escapeHtml(caseData.formType)}${closedLabel}`);
+        card.appendChild(title);
+        card.appendChild(document.createElement('br'));
+
+        const form = el('small', { color: '#333' });
+        form.appendChild(el('strong', {}, 'Form: '));
+        form.appendChild(textNode(escapeHtml(caseData.formName)));
+        card.appendChild(form);
+        card.appendChild(document.createElement('br'));
+
+        const updated = el('small', { color: updatedAtColor });
+        updated.appendChild(el('strong', {}, 'Last Updated: '));
+        updated.appendChild(textNode(formatDate(caseData.updatedAtTimestamp)));
+        card.appendChild(updated);
+        card.appendChild(document.createElement('br'));
+
+        const action = el('small', { color: '#333' });
+        action.appendChild(el('strong', {}, 'Current Action: '));
+        action.appendChild(textNode(
+            `${escapeHtml(caseData.currentActionCode)} - ${escapeHtml(caseData.currentActionDesc)}`
+        ));
+        card.appendChild(action);
+
+        // Events details
+        const details = document.createElement('details');
+        details.style.marginTop = '8px';
+        details.style.cursor = 'pointer';
+
+        const summary = document.createElement('summary');
+        summary.style.color = '#0066cc';
+        summary.style.fontWeight = 'bold';
+        summary.textContent = `Events History (${caseData.events.length})`;
+        details.appendChild(summary);
+
+        const eventsContainer = el('div', { marginTop: '8px', padding: '8px 0' });
+        eventsContainer.appendChild(renderTimeline(caseData.events, highlights));
+        details.appendChild(eventsContainer);
+
+        card.appendChild(details);
+        return card;
+    }
+
+    // --- Main Pane Rendering ---
+
+    function renderPane() {
+        let pane = document.getElementById('uscis-tracker-pane');
+        if (!pane) {
+            pane = document.createElement('div');
+            pane.id = 'uscis-tracker-pane';
+            document.body.appendChild(pane);
+        }
+
+        Object.assign(pane.style, {
+            position: 'fixed',
+            top: '80px',
+            right: '20px',
+            width: '380px',
+            maxHeight: 'calc(100vh - 100px)',
+            background: 'white',
+            border: '2px solid #0066cc',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+            zIndex: '10000',
+            fontFamily: 'Arial, sans-serif',
+            fontSize: '12px',
+            display: 'flex',
+            flexDirection: 'column'
+        });
+
+        // Clear previous content
+        pane.replaceChildren();
+
+        // --- Header (non-scrolling) ---
+        const header = el('div', {
+            padding: '15px 15px 10px 15px',
+            borderBottom: '1px solid #e0e0e0',
+            flexShrink: '0'
+        });
+
+        const heading = el('h3', { margin: '0 0 10px 0', color: '#0066cc' }, 'USCIS Case Status');
+        header.appendChild(heading);
+
+        const buttonBar = el('div', { display: 'flex', gap: '8px' });
+
+        const toggleBtn = el('button', {
+            padding: '4px 10px', fontSize: '11px', cursor: 'pointer',
+            background: '#0066cc', color: 'white', border: 'none', borderRadius: '4px'
+        }, caseIdsHidden ? 'Show Case IDs' : 'Hide Case IDs');
+        toggleBtn.addEventListener('click', () => {
+            caseIdsHidden = !caseIdsHidden;
+            renderPane();
+        });
+
+        const clearBtn = el('button', {
+            padding: '4px 10px', fontSize: '11px', cursor: 'pointer',
+            background: '#cc3333', color: 'white', border: 'none', borderRadius: '4px'
+        }, 'Clear History');
+        clearBtn.addEventListener('click', () => {
+            if (confirm('Clear all stored USCIS tracking history?')) {
+                clearAllHistory();
+            }
+        });
+
+        buttonBar.appendChild(toggleBtn);
+        buttonBar.appendChild(clearBtn);
+        header.appendChild(buttonBar);
+        pane.appendChild(header);
+
+        // --- Scrollable content ---
+        const content = el('div', {
+            padding: '15px', overflowY: 'auto', flex: '1'
+        });
+
+        const sortedCaseNumbers = Object.keys(currentCaseData).sort();
+        sortedCaseNumbers.forEach(caseNum => {
+            const caseData = currentCaseData[caseNum];
+            const highlights = fieldHighlights[caseNum] || {};
+            content.appendChild(renderCaseCard(caseNum, caseData, highlights));
+        });
+
+        pane.appendChild(content);
+    }
+
+    // --- Page Load ---
+
+    async function waitForCaseCardsComponent(maxAttempts = 30) {
+        await sleep(200);
+        for (let i = 0; i < maxAttempts; i++) {
+            const caseCardDivs = document.querySelectorAll('[id^="CaseCardsApp-react-component-"]');
+            if (caseCardDivs.length > 0) {
+                console.log('CaseCardsApp component found');
+                return caseCardDivs[0];
+            }
+            console.log(`Waiting for CaseCardsApp component... attempt ${i + 1}/${maxAttempts}`);
+            await sleep(200);
+        }
         console.warn('CaseCardsApp component not found after 15 seconds');
         return null;
     }
 
-    // Main function
-    async function trackCases() {
-        // Wait for the CaseCardsApp component to load
-        const caseCardsComponent = await waitForCaseCardsComponent();
+    // --- Main ---
 
+    async function trackCases() {
+        const caseCardsComponent = await waitForCaseCardsComponent();
         if (!caseCardsComponent) {
             console.warn('Could not load case cards component, attempting to extract case numbers anyway');
         }
 
         const caseNumbers = extractCaseNumbersFromDOM();
-        const stored = getStoredData();
+        const lastSavedCases = getLastSavedCases();
 
         const newData = {};
         for (const caseNum of caseNumbers) {
             const caseData = await fetchCaseData(caseNum);
-            if (caseData) {
-                newData[caseNum] = caseData;
-            }
+            if (caseData) newData[caseNum] = caseData;
         }
 
-        // Detect changes
-        const changes = detectChanges(stored.cases, newData);
+        fieldHighlights = detectFieldHighlights(lastSavedCases, newData);
+        currentCaseData = newData;
 
-        // Always display the pane with current data
-        createNotificationPane(newData);
+        renderPane();
 
-        // If there are changes, log them
+        const changes = Object.entries(fieldHighlights).filter(([_, h]) =>
+            h.isNew || h.updatedAtChanged || h.newEventIndices.size > 0
+        );
         if (changes.length > 0) {
             console.log('USCIS Case Changes Detected:', changes);
         }
 
-        // Save to localStorage
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({
-            cases: newData,
-            lastFetch: new Date().toISOString()
-        }));
+        saveToHistory(newData);
     }
 
-    // Run when page loads
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', trackCases);
     } else {
